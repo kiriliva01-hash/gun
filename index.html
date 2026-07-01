@@ -275,7 +275,6 @@
 </head>
 <body>
 <div class="container" id="appContainer">
-  <!-- Экран входа -->
   <div id="authScreen">
     <div class="logo-auth">DANGER</div>
     <div class="auth-form">
@@ -286,7 +285,6 @@
     </div>
   </div>
 
-  <!-- Список чатов -->
   <div id="chatListScreen">
     <div class="header">
       <span class="logo">DANGER</span>
@@ -299,7 +297,6 @@
     <button id="addChatBtn" class="add-btn">+</button>
   </div>
 
-  <!-- Экран чата -->
   <div id="chatScreen">
     <div class="header">
       <button id="backToListBtn" class="back-btn">←</button>
@@ -313,7 +310,6 @@
     </div>
   </div>
 
-  <!-- Оверлей поиска -->
   <div id="searchOverlay">
     <button id="closeSearchBtn" style="align-self:flex-end; background:none; border:none; color:#e53935; font-size:1.5rem; cursor:pointer;">✕</button>
     <div class="search-box">
@@ -324,7 +320,6 @@
   </div>
 </div>
 
-<!-- Gun.js CDN -->
 <script src="https://cdn.jsdelivr.net/npm/gun/gun.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gun/sea.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/gun/lib/radix.js"></script>
@@ -334,75 +329,94 @@
 
 <script>
   (function() {
-    // Инициализация Gun
+    // Подключаемся к публичному relay для координации пиров
     const gun = Gun({
-      peers: ['https://gun-manhattan.herokuapp.com/gun'] // публичный relay, можно добавить свои или убрать
+      peers: ['https://gun-manhattan.herokuapp.com/gun']
     });
     const user = gun.user();
     const SEA = Gun.SEA;
 
-    // DOM-элементы
+    // DOM
     const authScreen = document.getElementById('authScreen');
     const chatListScreen = document.getElementById('chatListScreen');
     const chatScreen = document.getElementById('chatScreen');
     const searchOverlay = document.getElementById('searchOverlay');
-
     const nickInput = document.getElementById('nickInput');
     const passwordInput = document.getElementById('passwordInput');
     const authSubmitBtn = document.getElementById('authSubmitBtn');
     const authError = document.getElementById('authError');
-
     const myNickLabel = document.getElementById('myNickLabel');
     const logoutBtn = document.getElementById('logoutBtn');
     const chatListContainer = document.getElementById('chatListContainer');
     const addChatBtn = document.getElementById('addChatBtn');
-
     const backToListBtn = document.getElementById('backToListBtn');
     const chatPartnerLabel = document.getElementById('chatPartnerLabel');
     const messagesContainer = document.getElementById('messagesContainer');
     const messageInput = document.getElementById('messageInput');
     const sendBtn = document.getElementById('sendBtn');
-
     const searchNickInput = document.getElementById('searchNickInput');
     const searchBtn = document.getElementById('searchBtn');
     const searchResults = document.getElementById('searchResults');
     const closeSearchBtn = document.getElementById('closeSearchBtn');
 
-    let currentUser = null;        // объект user.is
+    let currentUser = null;
     let currentNick = '';
     let activeChatId = null;
-    let activePartnerNick = '';
+    let activePartnerNick = null;
     let chatsSubscription = null;
     let messagesSubscription = null;
+    const chatListItems = {};
 
-    // ========== Аутентификация ==========
-    authSubmitBtn.addEventListener('click', () => {
+    // Вход / Регистрация
+    authSubmitBtn.addEventListener('click', async () => {
       const nick = nickInput.value.trim();
       const pass = passwordInput.value;
       if (!nick || !pass) {
         authError.textContent = 'Введите никнейм и пароль';
         return;
       }
-      // Gun: auth автоматически создаёт пользователя, если его нет
-      user.auth(nick, pass, (ack) => {
-        if (ack.err) {
-          authError.textContent = ack.err;
-          return;
-        }
-        // Успешно вошли / зарегистрировались
-        currentUser = user.is;
-        currentNick = nick;
-        // Сохраняем никнейм в публичном списке users для поиска
-        gun.get('users').get(nick).put({ pub: currentUser.pub });
-        // Показываем основной интерфейс
-        myNickLabel.textContent = nick;
-        authScreen.style.display = 'none';
-        chatListScreen.style.display = 'flex';
-        chatScreen.style.display = 'none';
-        searchOverlay.style.display = 'none';
-        loadChatList();
+
+      // Проверяем, не занят ли никнейм другим пользователем
+      const existing = await new Promise(resolve => {
+        gun.get('users').get(nick).once(data => resolve(data));
       });
+
+      if (existing && existing.pub) {
+        // Такой ник уже есть, пытаемся войти с введённым паролем
+        user.auth(nick, pass, (ack) => {
+          if (ack.err) {
+            authError.textContent = 'Неверный пароль или никнейм уже занят';
+          } else {
+            onAuthSuccess(user.is.pub, nick);
+          }
+        });
+      } else {
+        // Ник свободен — создаём нового пользователя
+        user.create(nick, pass, (ack) => {
+          if (ack.err) {
+            authError.textContent = ack.err;
+          } else {
+            // Сохраняем публичный ключ в глобальном списке
+            gun.get('users').get(nick).put({ pub: ack.pub });
+            onAuthSuccess(ack.pub, nick);
+          }
+        });
+      }
     });
+
+    function onAuthSuccess(pub, nick) {
+      currentUser = { pub };
+      currentNick = nick;
+      myNickLabel.textContent = nick;
+      authScreen.style.display = 'none';
+      chatListScreen.style.display = 'flex';
+      chatScreen.style.display = 'none';
+      searchOverlay.style.display = 'none';
+      authError.textContent = '';
+      nickInput.value = '';
+      passwordInput.value = '';
+      loadChatList();
+    }
 
     // Выход
     logoutBtn.addEventListener('click', () => {
@@ -416,21 +430,16 @@
       if (messagesSubscription) messagesSubscription.off();
     });
 
-    // ========== Загрузка списка чатов ==========
+    // Загрузка списка чатов
     function loadChatList() {
       if (!currentUser) return;
       if (chatsSubscription) chatsSubscription.off();
-      // Подписываемся на узел 'chats' текущего пользователя
       const chatsRef = gun.get('~' + currentUser.pub).get('chats');
-      chatsSubscription = chatsRef.map().on(async (chatData, chatId) => {
-        if (!chatData || !chatId) return;
-        // chatData содержит { partnerPub, partnerNick, lastMessage, lastTime }
-        // Обновляем/добавляем элемент в DOM
-        updateChatListItem(chatId, chatData);
+      chatsSubscription = chatsRef.map().on((data, chatId) => {
+        if (!data || !chatId) return;
+        updateChatListItem(chatId, data);
       });
     }
-
-    const chatListItems = {}; // храним DOM-элементы по chatId
 
     function updateChatListItem(chatId, data) {
       if (!data.partnerNick) return;
@@ -449,15 +458,13 @@
         chatListContainer.appendChild(item);
         chatListItems[chatId] = item;
       } else {
-        // Обновляем последнее сообщение
         const lastMsgEl = item.querySelector('.chat-item-lastmsg');
         lastMsgEl.textContent = escapeHtml((data.lastMessage || '').substring(0, 40));
-        // Перемещаем элемент вверх (сортировка по времени не обязательна)
         chatListContainer.prepend(item);
       }
     }
 
-    // ========== Поиск пользователей ==========
+    // Поиск пользователей
     addChatBtn.addEventListener('click', () => {
       searchOverlay.style.display = 'flex';
       searchNickInput.value = '';
@@ -468,15 +475,13 @@
     searchBtn.addEventListener('click', () => {
       const query = searchNickInput.value.trim();
       if (!query) return;
-      // Ищем пользователя в глобальном списке 'users'
       gun.get('users').get(query).once((data) => {
         searchResults.innerHTML = '';
         if (!data || !data.pub) {
           searchResults.innerHTML = '<p>Пользователь не найден</p>';
           return;
         }
-        const foundPub = data.pub;
-        if (foundPub === currentUser.pub) {
+        if (data.pub === currentUser.pub) {
           searchResults.innerHTML = '<p>Нельзя начать чат с самим собой</p>';
           return;
         }
@@ -486,17 +491,15 @@
         const startBtn = document.createElement('button');
         startBtn.className = 'start-chat-btn';
         startBtn.textContent = 'Написать';
-        startBtn.addEventListener('click', () => startChatWithUser(foundPub, query));
+        startBtn.addEventListener('click', () => startChatWithUser(data.pub, query));
         div.appendChild(startBtn);
         searchResults.appendChild(div);
       });
     });
 
     async function startChatWithUser(partnerPub, partnerNick) {
-      // Генерируем chatId как сортированные публичные ключи
       const sortedPubs = [currentUser.pub, partnerPub].sort();
-      const chatId = sortedPubs.join('_'); // простой chatId
-      // Сохраняем информацию о чате для текущего пользователя
+      const chatId = sortedPubs.join('_');
       const myChatsRef = gun.get('~' + currentUser.pub).get('chats');
       myChatsRef.get(chatId).put({
         partnerPub: partnerPub,
@@ -504,7 +507,6 @@
         lastMessage: '',
         lastTime: Date.now()
       });
-      // Для партнёра тоже записываем (чтобы и у него появился)
       gun.get('~' + partnerPub).get('chats').get(chatId).put({
         partnerPub: currentUser.pub,
         partnerNick: currentNick,
@@ -515,7 +517,7 @@
       openChat(chatId, partnerNick, partnerPub);
     }
 
-    // ========== Открытие чата ==========
+    // Открытие чата
     function openChat(chatId, partnerNick, partnerPub) {
       activeChatId = chatId;
       activePartnerNick = partnerNick;
@@ -526,11 +528,9 @@
       messageInput.focus();
 
       if (messagesSubscription) messagesSubscription.off();
-      // Подписываемся на сообщения чата: gun.get('chats').get(chatId).get('messages')
       const messagesRef = gun.get('chats').get(chatId).get('messages');
-      messagesSubscription = messagesRef.map().on(async (msgData, msgId) => {
+      messagesSubscription = messagesRef.map().on((msgData, msgId) => {
         if (!msgData || !msgId) return;
-        // Проверяем, не отображали ли уже это сообщение (по ID)
         if (document.getElementById(`msg-${msgId}`)) return;
         const isOwn = msgData.senderPub === currentUser.pub;
         addMessageElement(msgId, msgData.senderNick, msgData.text, msgData.time, isOwn);
@@ -557,7 +557,7 @@
       activeChatId = null;
     });
 
-    // ========== Отправка сообщений ==========
+    // Отправка сообщений
     sendBtn.addEventListener('click', sendMessage);
     messageInput.addEventListener('keypress', (e) => {
       if (e.key === 'Enter') sendMessage();
@@ -568,7 +568,7 @@
       if (!text || !activeChatId || !currentUser) return;
       const now = new Date();
       const time = now.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-      const msgId = Gun.text.random(); // уникальный ID сообщения
+      const msgId = Gun.text.random();
       const msg = {
         senderPub: currentUser.pub,
         senderNick: currentNick,
@@ -576,77 +576,45 @@
         time: time,
         timestamp: Date.now()
       };
-      // Сохраняем сообщение в чате
       gun.get('chats').get(activeChatId).get('messages').get(msgId).put(msg);
-      // Обновляем lastMessage в информации о чате для текущего пользователя
       gun.get('~' + currentUser.pub).get('chats').get(activeChatId).put({
         lastMessage: text,
         lastTime: Date.now()
       });
-      // Для партнёра тоже обновим (можно не делать, он сам увидит сообщение)
-      if (activePartnerNick && activeChatId) {
-        // Найдём партнёрский pub
-        const partnerPub = activeChatId.split('_').find(p => p !== currentUser.pub);
-        if (partnerPub) {
-          gun.get('~' + partnerPub).get('chats').get(activeChatId).put({
-            lastMessage: text,
-            lastTime: Date.now()
-          });
-        }
+      const partnerPub = activeChatId.split('_').find(p => p !== currentUser.pub);
+      if (partnerPub) {
+        gun.get('~' + partnerPub).get('chats').get(activeChatId).put({
+          lastMessage: text,
+          lastTime: Date.now()
+        });
       }
       messageInput.value = '';
     }
 
-    // ========== Утилиты ==========
     function escapeHtml(str) {
       return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
     }
 
-    // При загрузке страницы проверяем, авторизован ли уже пользователь (Gun сохраняет сессию)
-    // Если да, сразу показываем чаты
-    gun.on('auth', (ack) => {
-      // Это событие происходит после восстановления сессии
+    // Восстановление сессии при перезагрузке
+    gun.on('auth', async () => {
       if (user.is) {
         currentUser = user.is;
-        // Загружаем никнейм из памяти (можно сохранить при входе)
-        // Простой способ: запрашиваем у gun, кто мы
-        gun.get('~' + user.is.pub).get('nick').once((nickData) => {
-          currentNick = nickData || '';
-          myNickLabel.textContent = currentNick;
-          authScreen.style.display = 'none';
-          chatListScreen.style.display = 'flex';
-          loadChatList();
+        // Пытаемся восстановить никнейм из приватного хранилища
+        const nickNode = gun.get('~' + user.is.pub).get('nick');
+        nickNode.once((data) => {
+          if (data) {
+            currentNick = data;
+            myNickLabel.textContent = currentNick;
+            authScreen.style.display = 'none';
+            chatListScreen.style.display = 'flex';
+            loadChatList();
+          } else {
+            // если ник не сохранён (старый аккаунт), выходим
+            user.leave();
+          }
         });
       }
     });
-
-    // При входе дополнительно сохраним никнейм в своём профиле
-    // (переопределим authSubmitBtn для записи ника)
-    const origAuth = authSubmitBtn.onclick;
-    authSubmitBtn.onclick = async () => {
-      const nick = nickInput.value.trim();
-      const pass = passwordInput.value;
-      if (!nick || !pass) {
-        authError.textContent = 'Введите никнейм и пароль';
-        return;
-      }
-      user.auth(nick, pass, (ack) => {
-        if (ack.err) {
-          authError.textContent = ack.err;
-          return;
-        }
-        currentUser = user.is;
-        currentNick = nick;
-        gun.get('~' + currentUser.pub).get('nick').put(nick);
-        gun.get('users').get(nick).put({ pub: currentUser.pub });
-        myNickLabel.textContent = nick;
-        authScreen.style.display = 'none';
-        chatListScreen.style.display = 'flex';
-        chatScreen.style.display = 'none';
-        searchOverlay.style.display = 'none';
-        loadChatList();
-      });
-    };
   })();
 </script>
 </body>
